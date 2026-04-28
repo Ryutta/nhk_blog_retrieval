@@ -1,3 +1,4 @@
+import concurrent.futures
 import feedparser
 import re
 import pandas as pd
@@ -7,96 +8,98 @@ from bs4 import BeautifulSoup
 
 @st.cache_data(ttl=3600)
 def get_posts():
-    # To get a more comprehensive history rather than just the last 20 from RSS,
-    # we can try to scrape a few pages of entrylist.
-    # However, since we don't want to over-scrape, we'll try to fetch a few pages.
-    # Actually, let's keep the RSS for simplicity as it's much more robust and we can fall back to it,
-    # but the reviewer noted RSS feed only contains recent 15-20 entries. Let's write a scraper for the entry list.
-
     posts = []
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    base_url = "https://ameblo.jp/amnn1/entrylist"
 
-    # Let's scrape the first 5 pages (up to 100 entries) to get a better history
-    for page in range(1, 6):
-        url = f"{base_url}-{page}.html" if page > 1 else f"{base_url}.html"
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code != 200:
+    def fetch_month(year, month):
+        month_posts = []
+        page = 1
+        unique_links = set()
+        while True:
+            if page == 1:
+                url = f"https://ameblo.jp/amnn1/archive-{year}{month:02d}.html"
+            else:
+                url = f"https://ameblo.jp/amnn1/archive{page}-{year}{month:02d}.html"
+
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                if response.status_code != 200:
+                    break
+
+                soup = BeautifulSoup(response.content, 'lxml')
+                items = [a for a in soup.select('a') if 'href' in a.attrs and 'entry-' in a['href'] and a.text.strip()]
+
+                new_items_found = False
+                for item in items:
+                    title = item.text.strip()
+                    link = item['href']
+                    if link and link.startswith('/'):
+                        link = f"https://ameblo.jp{link}"
+
+                    if link not in unique_links:
+                        unique_links.add(link)
+                        new_items_found = True
+
+                        program = "その他"
+                        if "ラジオ英会話" in title:
+                            program = "ラジオ英会話"
+                        elif "ビジネス英語" in title:
+                            program = "ラジオビジネス英語"
+                        elif "現代英語" in title:
+                            program = "現代英語"
+                        elif "タイムトライアル" in title:
+                            program = "タイムトライアル"
+
+                        date = ""
+                        date_match = re.search(r'(\d+月\d+日)', title)
+                        if date_match:
+                            date = f"{year}年{date_match.group(1)}"
+
+                        month_posts.append({
+                            '日付': date,
+                            '番組': program,
+                            'URL': link,
+                            'タイトル': title,
+                            'sort_key': f"{year}{month:02d}"
+                        })
+
+                if not new_items_found:
+                    break
+
+                next_page = False
+                for a in soup.find_all('a'):
+                    if '次' in a.text:
+                        next_page = True
+                        break
+
+                if not next_page:
+                    break
+
+                page += 1
+            except Exception as e:
                 break
-            soup = BeautifulSoup(response.content, 'lxml')
+        return month_posts
 
-            # Find the title links in the entry list
-            items = soup.select('h2[data-uranus-component="entryItemTitle"] a')
-            if not items:
-                break
+    years = [2026, 2025]
+    months = list(range(12, 0, -1))
 
-            for item in items:
-                title = item.text.strip()
-                link = item.get('href')
-                if link and link.startswith('/'):
-                    link = f"https://ameblo.jp{link}"
+    tasks = [(y, m) for y in years for m in months]
 
-                program = "その他"
-                if "ラジオ英会話" in title:
-                    program = "ラジオ英会話"
-                elif "ビジネス英語" in title:
-                    program = "ラジオビジネス英語"
-                elif "現代英語" in title:
-                    program = "現代英語"
-                elif "タイムトライアル" in title:
-                    program = "タイムトライアル"
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        results = executor.map(lambda args: fetch_month(*args), tasks)
 
-                date = ""
-                date_match = re.search(r'(\d+月\d+日)', title)
-                if date_match:
-                    date = date_match.group(1)
+    for month_posts in results:
+        posts.extend(month_posts)
 
-                posts.append({
-                    '日付': date,
-                    '番組': program,
-                    'URL': link,
-                    'タイトル': title
-                })
-        except Exception as e:
-            # st.warning(f"Error fetching page {page}: {e}")
-            break
+    seen_urls = set()
+    deduped_posts = []
+    for p in posts:
+        if p['URL'] not in seen_urls:
+            seen_urls.add(p['URL'])
+            deduped_posts.append(p)
 
-    # Fallback to RSS if scraping failed completely
-    if not posts:
-        url = "https://rssblog.ameba.jp/amnn1/rss20.xml"
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            feed = feedparser.parse(response.content)
-            for entry in feed.entries:
-                title = entry.title
-                link = entry.link
+    return deduped_posts
 
-                program = "その他"
-                if "ラジオ英会話" in title:
-                    program = "ラジオ英会話"
-                elif "ビジネス英語" in title:
-                    program = "ラジオビジネス英語"
-                elif "現代英語" in title:
-                    program = "現代英語"
-                elif "タイムトライアル" in title:
-                    program = "タイムトライアル"
-
-                date = ""
-                date_match = re.search(r'(\d+月\d+日)', title)
-                if date_match:
-                    date = date_match.group(1)
-
-                posts.append({
-                    '日付': date,
-                    '番組': program,
-                    'URL': link,
-                    'タイトル': title
-                })
-        except Exception as e:
-            st.error(f"Failed to fetch data: {e}")
-
-    return posts
 
 def main():
     st.set_page_config(page_title="NHK英語スクリプト集", page_icon="📻", layout="wide")
